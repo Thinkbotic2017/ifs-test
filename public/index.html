@@ -1,0 +1,348 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IFS SITS Query Tester</title>
+<style>
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color:#1e293b;background:#f4f7fb}
+*{box-sizing:border-box}
+body{margin:0}
+.wrap{max-width:1400px;margin:auto;padding:24px}
+.head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.head h1{margin:0;font-size:26px}
+.sub{color:#64748b;margin-top:7px}
+.panel,.query{background:#fff;border:1px solid #dbe3ee;border-radius:14px;padding:18px;margin-top:18px;box-shadow:0 2px 8px #0f172a08}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.field label{display:block;font-size:12px;color:#475569;font-weight:700;margin-bottom:6px}
+.field input{width:100%;padding:10px 11px;border:1px solid #cbd5e1;border-radius:8px;font-size:14px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+button{border:0;border-radius:8px;background:#4f39f6;color:white;padding:10px 15px;font-weight:700;cursor:pointer}
+button.secondary{background:#e8eaf2;color:#334155}
+button:disabled{opacity:.5;cursor:not-allowed}
+.status{margin-top:12px;font-size:14px}
+.ok{color:#047857}
+.bad{color:#b91c1c}
+.query h3{margin:0 0 6px}
+.meta{font-size:13px;color:#64748b}
+.query-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.pill{border-radius:20px;padding:4px 9px;font-size:12px;background:#e2e8f0}
+.pill.ok{background:#d1fae5}
+.pill.bad{background:#fee2e2}
+pre{white-space:pre-wrap;overflow:auto;background:#0f172a;color:#dbeafe;padding:13px;border-radius:8px;font-size:12px;max-height:240px}
+.table-wrap{overflow:auto;margin-top:10px}
+table{border-collapse:collapse;width:100%;font-size:12px;white-space:nowrap}
+th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left;max-width:360px;overflow:hidden;text-overflow:ellipsis}
+th{background:#f1f5f9;position:sticky;top:0}
+.note{background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:12px;color:#9a3412;font-size:13px}
+.muted{color:#64748b;font-size:12px}
+.hide{display:none}
+@media(max-width:600px){.wrap{padding:12px}.head h1{font-size:22px}}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <div class="head">
+    <div>
+      <h1>IFS → SITS Query Tester</h1>
+      <div class="sub">Run the polling queries against IFS Oracle and inspect results together.</div>
+    </div>
+    <span class="pill">Read-only runner</span>
+  </div>
+
+  <section class="panel">
+    <div class="note">
+      <b>Before running:</b> set Oracle connection details in your local
+      <code>.env</code>. Use an IFS read-only account. This tool runs Q0–Q6
+      and does not write to IFS or save data to SITS.
+    </div>
+
+    <h3>Test parameters</h3>
+    <div class="grid">
+      <div class="field">
+        <label for="gateEntryNo">Gate entry number (Q2/Q3)</label>
+        <input id="gateEntryNo" value="GE-0002">
+      </div>
+      <div class="field">
+        <label for="watermarkDate">Watermark date (Q1)</label>
+        <input id="watermarkDate" value="2026-10-01 00:00:00">
+      </div>
+      <div class="field">
+        <label for="watermarkCursor">Watermark cursor (Q1)</label>
+        <input id="watermarkCursor" value="GE-0001">
+      </div>
+      <div class="field">
+        <label for="limit">Q1 limit (1–1000)</label>
+        <input id="limit" type="number" min="1" max="1000" value="25">
+      </div>
+      <div class="field">
+        <label for="partNos">Part numbers (Q4/Q5/Q6, comma-separated)</label>
+        <input id="partNos" value="PART-A,PART-B">
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="connection">Test connection</button>
+      <button id="runAll">Run all queries</button>
+      <button id="exportCsv" class="secondary" disabled>Export CSV</button>
+      <button id="clear" class="secondary">Clear results</button>
+    </div>
+    <div id="status" class="status" role="status">Ready. Fill .env before connecting.</div>
+  </section>
+
+  <section id="summary" class="panel hide"></section>
+  <section id="results"></section>
+
+  <p class="muted">
+    Security: the server binds to 127.0.0.1 by default. Do not expose this
+    utility to a public network. Never share your .env file or credentials.
+  </p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let latestRunData = null;
+
+function params() {
+  return {
+    gateEntryNo: $('gateEntryNo').value.trim(),
+    watermarkDate: $('watermarkDate').value.trim(),
+    watermarkCursor: $('watermarkCursor').value.trim(),
+    limit: Number($('limit').value || 25),
+    partNos: $('partNos').value.split(',').map(s => s.trim()).filter(Boolean)
+  };
+}
+
+function status(msg, kind = '') {
+  $('status').textContent = msg;
+  $('status').className = 'status ' + kind;
+}
+
+async function post(url, body = {}) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error('Invalid server response. Check the Node.js terminal.');
+  }
+
+  if (!response.ok && !data.error) {
+    throw new Error('Request failed: HTTP ' + response.status);
+  }
+
+  return data;
+}
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&':'&amp;',
+    '<':'&lt;',
+    '>':'&gt;',
+    '"':'&quot;',
+    "'":'&#39;'
+  }[character]));
+}
+
+function table(rows) {
+  if (!rows || !rows.length) {
+    return '<p class="muted">No rows returned.</p>';
+  }
+
+  const columns = [...new Set(rows.flatMap(row => Object.keys(row)))];
+
+  return '<div class="table-wrap"><table><thead><tr>' +
+    columns.map(column => '<th>' + esc(column) + '</th>').join('') +
+    '</tr></thead><tbody>' +
+    rows.map(row => '<tr>' + columns.map(column => {
+      const value = row[column];
+      const display = value !== null && typeof value === 'object'
+        ? JSON.stringify(value)
+        : value;
+      return '<td title="' + esc(display ?? '') + '">' +
+        esc(display ?? '') + '</td>';
+    }).join('') + '</tr>').join('') +
+    '</tbody></table></div>';
+}
+
+function render(data) {
+  const results = data.results || [];
+  const passed = results.filter(result => result.ok).length;
+  const totalRows = results.reduce(
+    (sum, result) => sum + (result.rowCount || 0), 0
+  );
+
+  $('summary').classList.remove('hide');
+  $('summary').innerHTML =
+    '<b>Run summary</b><div class="grid" style="margin-top:12px">' +
+    '<div><div class="muted">Queries passed</div><h2>' +
+    passed + ' / ' + results.length + '</h2></div>' +
+    '<div><div class="muted">Total rows returned</div><h2>' +
+    totalRows + '</h2></div>' +
+    '<div><div class="muted">Executed at</div><div>' +
+    esc(data.executedAt || '—') + '</div></div></div>';
+
+  $('results').innerHTML = results.map(result =>
+    '<article class="query"><div class="query-head"><div><h3>' +
+    esc((result.id ?? '') + ' — ' + (result.name ?? '')) +
+    '</h3><div class="meta">' +
+    esc(result.durationMs === undefined ? '' : result.durationMs + ' ms · ') +
+    (result.rowCount ?? 0) + ' row(s)</div></div><span class="pill ' +
+    (result.ok ? 'ok' : 'bad') + '">' +
+    (result.ok ? 'SUCCESS' : 'FAILED') + '</span></div>' +
+    (result.error ? '<p class="bad">' + esc(result.error) + '</p>' : '') +
+    '<details><summary>SQL and bound parameters</summary><pre>' +
+    esc(result.sql || '') + '\n\nParameters: ' +
+    esc(JSON.stringify(result.params || [])) +
+    '</pre></details>' + table(result.rows || []) + '</article>'
+  ).join('');
+}
+
+// CSV export helpers
+function csvCell(value) {
+  let text = value == null
+    ? ''
+    : typeof value === 'object'
+      ? JSON.stringify(value)
+      : String(value);
+
+  // Avoid exporting spreadsheet formula-like values as executable formulas.
+  if (/^[\s]*[=+\-@]/.test(text)) {
+    text = "'" + text;
+  }
+
+  return '"' + text.replace(/"/g, '""') + '"';
+}
+
+function exportCsv() {
+  if (!latestRunData) {
+    status('Please run the queries first.', 'bad');
+    return;
+  }
+
+  const results = latestRunData.results || [];
+  const dataColumns = [...new Set(
+    results.flatMap(result =>
+      (result.rows || []).flatMap(row => Object.keys(row))
+    )
+  )];
+
+  const columns = [
+    'Query ID',
+    'Query Name',
+    'Status',
+    'Row Number',
+    'Error',
+    ...dataColumns
+  ];
+
+  const csvRows = [columns];
+
+  for (const result of results) {
+    const records = result.rows || [];
+
+    if (records.length) {
+      records.forEach((record, index) => {
+        csvRows.push([
+          result.id ?? '',
+          result.name ?? '',
+          result.ok ? 'SUCCESS' : 'FAILED',
+          index + 1,
+          result.error || '',
+          ...dataColumns.map(column => record[column] ?? '')
+        ]);
+      });
+    } else {
+      csvRows.push([
+        result.id ?? '',
+        result.name ?? '',
+        result.ok ? 'SUCCESS' : 'FAILED',
+        '',
+        result.error || 'No rows returned',
+        ...dataColumns.map(() => '')
+      ]);
+    }
+  }
+
+  const csv = '\uFEFF' + csvRows
+    .map(row => row.map(csvCell).join(','))
+    .join('\r\n');
+
+  const blob = new Blob([csv], {type: 'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+
+  link.href = url;
+  link.download = 'IFS-SITS-Query-Results-' +
+    new Date().toISOString().replace(/[:.]/g, '-') + '.csv';
+
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  status('CSV export downloaded.', 'ok');
+}
+
+$('exportCsv').onclick = exportCsv;
+
+$('connection').onclick = async () => {
+  $('connection').disabled = true;
+  status('Testing connection…');
+
+  try {
+    const data = await post('/api/test-connection');
+    status(
+      data.message || (data.ok ? 'Connection successful.' : 'Connection failed.'),
+      data.ok ? 'ok' : 'bad'
+    );
+  } catch (error) {
+    status(error.message, 'bad');
+  } finally {
+    $('connection').disabled = false;
+  }
+};
+
+$('runAll').onclick = async () => {
+  $('runAll').disabled = true;
+  $('exportCsv').disabled = true;
+  latestRunData = null;
+  status('Running Q0–Q6…');
+  $('results').innerHTML = '';
+
+  try {
+    const data = await post('/api/run-all', params());
+    render(data);
+
+    latestRunData = data;
+    $('exportCsv').disabled = !(data.results && data.results.length);
+
+    status(
+      data.ok
+        ? 'All queries completed successfully.'
+        : 'Completed with one or more query errors. Check each result below.',
+      data.ok ? 'ok' : 'bad'
+    );
+  } catch (error) {
+    status(error.message, 'bad');
+  } finally {
+    $('runAll').disabled = false;
+  }
+};
+
+$('clear').onclick = () => {
+  $('results').innerHTML = '';
+  $('summary').classList.add('hide');
+  latestRunData = null;
+  $('exportCsv').disabled = true;
+  status('Results cleared.');
+};
+</script>
+</body>
+</html>
